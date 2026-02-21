@@ -16,7 +16,7 @@ import {
     Collection
 } from 'discord.js';
 import { MAX_MEMBER_COUNT, ALPHABET_TABLE, eMessage, SPACE_REGXg, TEAMBUILD_DEFAULT_NUM } from "./Const";
-import { GambleSyncMode, User as MyUser, SendMemberRoleOption, SplaJinroData, WorkData } from "./Model";
+import { User as MyUser, SendMemberRoleOption, SplaJinroData, WorkData } from "./Model";
 import { eCommandOptions, eCommands, isMyCommand, CommandParser } from "./Commands"
 import { Utils } from "./Utilis";
 import { DiscordUtils, MessageContent } from "./DiscordUtils";
@@ -24,7 +24,11 @@ import { DBAccesser, DBUtils } from "./db";
 import { ResultOK } from './Result';
 import { eContextMenuCommands, isMyContextMenuCommand } from './ContextMenuCommands';
 import config from './config';
-import { SyncSheetService } from './gamble/SyncSheet';
+import { CommandHandler } from './features/CommandHandler';
+import { SplaJinroCommandHandler } from './features/splajinro/SplaJinroCommandHandler';
+import { GambleCommandHandler } from './features/gamble/GambleCommandHandler';
+import { GambleFeatureService } from './features/gamble/GambleFeatureService';
+import { eSendType, MessageFactory, MyResult, SendListItem } from './core/messaging/MessageFactory';
 // import {
 //     DateRangeModal,
 //     DeleteConfirmModal, 
@@ -60,33 +64,30 @@ import { v4 as uuidv4 } from "uuid";
 //          必要なら議論タイムで名乗るってのがゲームだと思うし。
 // TODO controler　は inner と外用で分けたい。例外処理も controlerがわで
 
-const eSendType = {
-    sendReply: 1,
-    sendReplyByDM: 2,
-    sendDMByUserId: 3,
-    sendSameChannel: 4,
-    sendOtherChannel: 5,
-} as const;
-type eSendType = (typeof eSendType)[keyof typeof eSendType];
-
-type SendListItem = {
-    type: eSendType,
-    user: MyUser,
-    sendMessage: MessageContent,
-    targetChannel?: TextBasedChannel,
-}
-
 const MySuccess = "success";
 const MyError = "error";
-type MyResult = {
-    status: typeof MySuccess | typeof MyError,
-    sendList: SendListItem[]
-}
 
 export class Controller {
     private _dbAccesser: DBAccesser | null = null;
+    private readonly commandHandlers: CommandHandler[];
 
     constructor() {
+        this.commandHandlers = [
+            new SplaJinroCommandHandler({
+                updateMember: this.updateMember,
+                suggestRole: this.suggestRole,
+                sendRole: this.sendRole,
+                createVote: this.createVote,
+                ejectMemberForVote: this.ejectMemberForVote,
+                updateSendRoleOption: this.updateSendRoleOption,
+                clearData: this.clearData,
+                buildTeam: this.buildTeam,
+                messageCopy: this.messageCopy,
+            }),
+            new GambleCommandHandler({
+                gambleSync: this.gambleSync,
+            }),
+        ];
     }
 
     get initialized(): boolean {
@@ -94,6 +95,9 @@ export class Controller {
     }
     get connectedDB(): DBAccesser {
         return this._dbAccesser!;
+    }
+    private get gambleFeatureService(): GambleFeatureService {
+        return new GambleFeatureService(this.connectedDB);
     }
     asyncSetup = async () => {
         this._dbAccesser = await DBAccesser.connect();
@@ -300,108 +304,50 @@ export class Controller {
 
     /* コマンドの実装 */
     processPlaneTextCommand = async (cmd: CommandParser, user: User, channel: TextBasedChannel, users: MyUser[], interaction?: Interaction): Promise<MyResult> => {
-        let isDM = DiscordUtils.isDM(channel);
-        let sender: MyUser = {
+        const isDM = DiscordUtils.isDM(channel);
+        const sender: MyUser = {
             id: user.id,
             name: user.displayName,
+        };
+
+        const handler = this.commandHandlers.find(h => h.canHandle(cmd));
+        if (handler) {
+            return handler.handle({
+                cmd,
+                user,
+                channel,
+                mentionUsers: users,
+                interaction,
+                isDM,
+                channelId: channel.id,
+                sender,
+            });
         }
 
-        switch (cmd.command) {
-            case eCommands.Member:
-                return await this.updateMember(isDM, channel.id, channel, sender, cmd, users);
-            case eCommands.SuggestRole:
-                return await this.suggestRole(isDM, channel.id, channel, sender, cmd);
-            case eCommands.SendRole:
-                return await this.sendRole(isDM, channel.client, sender, cmd, true/* コマンドが送られている=>GMが送っていると判断 */);
-            case eCommands.CreateVote:
-                return await this.createVote(isDM, channel.id, channel, sender, user);
-            case eCommands.EjectFromVote:
-                return await this.ejectMemberForVote(isDM, channel.id, channel, sender, cmd, users);
-            case eCommands.SendRoleOption:
-                return await this.updateSendRoleOption(isDM, channel.id, cmd);
-            case eCommands.ClearMemberData:
-                return await this.clearData(isDM, channel.id);
-            case eCommands.TeamBuilder:
-                return await this.buildTeam(isDM, channel.id, channel, sender, cmd);
-            case eCommands.MessageCopy:
-                return await this.messageCopy(isDM, channel.client, channel, sender, cmd, interaction);
-            case eCommands.GambleSync:
-                return await this.gambleSync(isDM, channel.id, cmd);
-            default:
-                return {
-                    status: MySuccess,
-                    sendList: [],
-                };
-        }
+        return {
+            status: MySuccess,
+            sendList: [],
+        };
     }
 
     gambleSync = async (isDM: boolean, channelId: string, cmd: CommandParser): Promise<MyResult> => {
-        if (isDM) {
-            return MyFuncs.createErrorReply("/gb_sync はサーバーチャンネルから実行してください。");
-        }
-
-        const { status, value: session } = await this.connectedDB.asyncSelectGambleSessionForce(channelId);
-        if (status != ResultOK) {
-            return MyFuncs.createErrorReply(status);
-        }
-
-        const spreadsheetId = cmd.getValue(0, 1) ?? session.spreadsheetId;
-        const sheetName = cmd.getValue(0, 2) ?? session.sheetName;
-        const credentialRef = cmd.getValue(0, 3) ?? session.credentialRef;
-        const mode = (cmd.getValue(0, 4) as GambleSyncMode | null) ?? "full";
-
-        const updSuccess = await this.connectedDB.asyncUpdateGambleSession(channelId, {
-            spreadsheetId,
-            sheetName,
-            credentialRef,
-        });
-        if (!updSuccess) {
-            return MyFuncs.createErrorReply(eMessage.C00_DBError);
-        }
-
-        try {
-            const syncSession = {
-                ...session,
-                spreadsheetId,
-                sheetName,
-                credentialRef,
-            };
-            const result = await SyncSheetService.sync(syncSession, mode);
-            return MyFuncs.createSuccessReply(
-                `同期に成功しました。mode=${result.mode}\nusers_balance=${result.rows.users_balance}, bets=${result.rows.bets}, ledger=${result.rows.ledger}\nspreadsheetId=${spreadsheetId}`,
-            );
-        }
-        catch (e) {
-            return MyFuncs.createErrorReply(SyncSheetService.toDiscordErrorMessage(e));
-        }
+        return this.gambleFeatureService.gambleSync(isDM, channelId, cmd);
     }
-    
+
     resolveGame = async (sessionId: string, gameId: string, winningTicket: string): Promise<MyResult> => {
-        try {
-            const { summary } = await this.connectedDB.asyncResolveGame(sessionId, gameId, winningTicket);
-            const msg = [
-                `ゲーム確定が完了しました。`,
-                `- 総額: ${summary.totalStake}`,
-                `- 当選口数: ${summary.winningBetCount}`,
-                `- 最大払戻: ${summary.maxPayout}`,
-            ].join("\n");
-            return MyFuncs.createSuccessReply(msg);
-        }
-        catch (error) {
-            const errMessage = error instanceof Error ? error.message : "ゲーム確定処理で不明なエラーが発生しました。";
-            return MyFuncs.createErrorReply(errMessage);
-        }
+        return this.gambleFeatureService.resolveGame(sessionId, gameId, winningTicket);
     }
+
 
     updateMember = async (isDM: boolean, channelId: string, ch: Channel, sender: MyUser, cmd: CommandParser, inputMenbers: MyUser[]): Promise<MyResult> => {
         if (isDM && inputMenbers.length > 0) {
             // ではだめにする。メンバーのメンションが必要なので
-            return MyFuncs.createErrorReply(eMessage.C02_NotAllowFromDM);
+            return MessageFactory.createErrorReply(eMessage.C02_NotAllowFromDM);
         }
 
         const { status, value: data } = await this.connectedDB.asyncSelectSplaJinroDataForce(channelId);
         if (status != ResultOK) {
-            return MyFuncs.createErrorReply(status);
+            return MessageFactory.createErrorReply(status);
         }
 
         // 現人狼参加者
@@ -466,7 +412,7 @@ export class Controller {
                 }
             }
 
-            return MyFuncs.createSuccessReply({
+            return MessageFactory.createSuccessReply({
                 content: eMessage.C02_MemberView,
                 embeds: embeds,
             });
@@ -515,7 +461,7 @@ export class Controller {
             'ignore_member_list': concatMemberListWithFlag.filter(m => m.status == "delete").map(m => m.member),
         });
         if (!updSuccess) {
-            return MyFuncs.createErrorReply(eMessage.C02_DBError,);
+            return MessageFactory.createErrorReply(eMessage.C02_DBError,);
         }
 
         // 参照モードを利用して最終的なメンバーのメッセージを取得し、返信
@@ -531,7 +477,7 @@ export class Controller {
 
         const { status, value: data } = await this.connectedDB.asyncSelectSplaJinroDataForce(channelId,)
         if (status != ResultOK) {
-            return MyFuncs.createErrorReply(status);
+            return MessageFactory.createErrorReply(status);
         }
 
         // 複数のメッセージが入る場合があるので先に作っておく
@@ -551,19 +497,19 @@ export class Controller {
             uesPredata = true;
             cmd = CommandParser.fromPlaneText(data.prev_suggest_role_command_string ?? "");
             if (cmd.isEmpty()) {
-                return MyFuncs.createErrorReply(eMessage.C03_NonAgainData,);
+                return MessageFactory.createErrorReply(eMessage.C03_NonAgainData,);
             }
         }
         // コマンドチェックつづき
         // 前回データの利用だからといってエラーにならないわけでは無い
         if (cmd.getValue(0, 2) == null) {
             result.status = MyError;
-            result.sendList.push(MyFuncs.createReply(eMessage.C03_RorlArgNothing, eCommands.SuggestRole))
+            result.sendList.push(MessageFactory.createReply(eMessage.C03_RorlArgNothing, eCommands.SuggestRole))
             return result;
         }
         else if ((cmd.getLength(0) - 2) > MAX_MEMBER_COUNT) {
             result.status = MyError;
-            result.sendList.push(MyFuncs.createReply(eMessage.C03_ToMany, MAX_MEMBER_COUNT))
+            result.sendList.push(MessageFactory.createReply(eMessage.C03_ToMany, MAX_MEMBER_COUNT))
             return result;
         }
 
@@ -575,7 +521,7 @@ export class Controller {
         }
 
         if (uesPredata) {
-            result.sendList.push(MyFuncs.createReply(
+            result.sendList.push(MessageFactory.createReply(
                 eMessage.C03_UsePredata,
                 theName,
                 roleNameList.join("、")))
@@ -585,18 +531,18 @@ export class Controller {
         const memberList = MyFuncs.getSplaJinroMemberList(data, ch, sender, !noCheckOptExists);
         if (memberList.length == 0) {
             result.status = MyError;
-            result.sendList.push(MyFuncs.createReply(eMessage.C03_MemberNothing,))
+            result.sendList.push(MessageFactory.createReply(eMessage.C03_MemberNothing,))
             return result;
         }
         // メンバー多すぎ問題
         if (memberList.length > MAX_MEMBER_COUNT) {
             result.status = MyError;
-            result.sendList.push(MyFuncs.createReply(eMessage.C03_ToMany, MAX_MEMBER_COUNT));
+            result.sendList.push(MessageFactory.createReply(eMessage.C03_ToMany, MAX_MEMBER_COUNT));
             return result;
         }
         if (memberList.length < roleNameList.length) {
             result.status = MyError;
-            result.sendList.push(MyFuncs.createReply(
+            result.sendList.push(MessageFactory.createReply(
                 eMessage.C03_MemberFew,
                 roleNameList.length,
                 memberList.length));
@@ -674,8 +620,8 @@ export class Controller {
             // --no-checkオプションがない場合
             // メッセージに sendRole用コマンドを含める
             result.sendList.push(
-                MyFuncs.createReplyDM(eMessage.C03_SuggestMemberExplain),
-                MyFuncs.createReplyDM(planeTextForSnedRole),
+                MessageFactory.createReplyDM(eMessage.C03_SuggestMemberExplain),
+                MessageFactory.createReplyDM(planeTextForSnedRole),
             );
         }
 
@@ -695,34 +641,34 @@ export class Controller {
     sendRole = async (isDM: boolean, client: Client, sender: MyUser, cmd: CommandParser, isSenderRoleChecked: boolean): Promise<MyResult> => {
         if (!isDM) {
             // DMで送らないと視えちゃうのでだめ
-            return MyFuncs.createErrorReply(eMessage.C04_NeedDM);
+            return MessageFactory.createErrorReply(eMessage.C04_NeedDM);
         }
 
         // コマンドチェック
         const channelId = cmd.getValue(1, 0);
         if (channelId == null) {
-            return MyFuncs.createErrorReply(eMessage.C04_ChannelIdArgNothing,);
+            return MessageFactory.createErrorReply(eMessage.C04_ChannelIdArgNothing,);
         }
 
         if (cmd.getValue(2, 0) == null) {
-            return MyFuncs.createErrorReply(eMessage.C04_MemberArgNothing,);
+            return MessageFactory.createErrorReply(eMessage.C04_MemberArgNothing,);
         }
 
         // メンバー情報を取得するため、人狼部屋のチャンネルを取得
         const ch = await client.channels.fetch(channelId).catch(() => console.log("invalid channel id. [" + channelId + "]"));
         if (!ch || ch.isDMBased() || !config.allowedServers.includes(ch.guildId)) {
-            return MyFuncs.createErrorReply(eMessage.C04_InvalidChannelId,);
+            return MessageFactory.createErrorReply(eMessage.C04_InvalidChannelId,);
         }
 
         // メンバー取得
         const { status, value: data } = await this.connectedDB.asyncSelectSplaJinroDataForce(channelId,);
         if (status != ResultOK) {
-            return MyFuncs.createErrorReply(status);
+            return MessageFactory.createErrorReply(status);
         }
 
         const memberList = MyFuncs.getSplaJinroMemberList(data, ch, sender, isSenderRoleChecked);
         if (memberList.length == 0) {
-            return MyFuncs.createErrorReply(eMessage.C04_MemberNothing,);
+            return MessageFactory.createErrorReply(eMessage.C04_MemberNothing,);
         }
 
         // コマンド情報から、メンバー情報をパース
@@ -730,7 +676,7 @@ export class Controller {
 
         // メンバーより少ない分には良しとする。参加者以外がメンバーに入っている場合はエラー
         if (memberRoleList.some(mr => !memberList.some(m => m.id == mr.id))) {
-            return MyFuncs.createErrorReply(eMessage.C04_UnknownMemberContain, eCommands.SuggestRole);
+            return MessageFactory.createErrorReply(eMessage.C04_UnknownMemberContain, eCommands.SuggestRole);
         }
 
         // 送信コマンドを記憶する。投票除外メンバーをリセットする
@@ -739,7 +685,7 @@ export class Controller {
             'eject_member_list': [],
         });
         if (!updSuccess) {
-            return MyFuncs.createErrorReply(eMessage.C04_DBError,);
+            return MessageFactory.createErrorReply(eMessage.C04_DBError,);
         }
 
         // 各メンバーにDM
@@ -750,7 +696,7 @@ export class Controller {
 
         for (const mem of memberRoleList) {
             result.sendList.push(
-                MyFuncs.createDMToOtherUser(
+                MessageFactory.createDMToOtherUser(
                     mem,
                     eMessage.C04_SendRoleTmpl,
                     mem.theName, mem.role
@@ -765,7 +711,7 @@ export class Controller {
                 // △△に◆◆の役職を伝えるオプション
                 for (const mem of memberRoleList.filter(mem => mem.role == opt.targetRole)) {
                     result.sendList.push(
-                        MyFuncs.createDMToOtherUser(
+                        MessageFactory.createDMToOtherUser(
                             mem,
                             eMessage.C04_SendKnowTmpl,
                             mem.role,
@@ -780,7 +726,7 @@ export class Controller {
         }
 
         // 送信成功を伝えるDM
-        result.sendList.push(MyFuncs.createReply(eMessage.C04_DMSuccess,));
+        result.sendList.push(MessageFactory.createReply(eMessage.C04_DMSuccess,));
         return result;
     }
 
@@ -792,16 +738,16 @@ export class Controller {
      */
     createVote = async (isDM: boolean, channelId: string, ch: Channel, sender: MyUser, user: User): Promise<MyResult> => {
         if (isDM) {
-            return MyFuncs.createErrorReply(eMessage.C05_NotAllowFromDM);
+            return MessageFactory.createErrorReply(eMessage.C05_NotAllowFromDM);
         }
 
         const { status, value: data } = await this.connectedDB.asyncSelectSplaJinroDataForce(channelId);
         if (status != ResultOK) {
-            return MyFuncs.createErrorReply(status);
+            return MessageFactory.createErrorReply(status);
         }
 
         if (!data.prev_send_role_command_string) {
-            return MyFuncs.createErrorReply(eMessage.C05_NotStartJinro);
+            return MessageFactory.createErrorReply(eMessage.C05_NotStartJinro);
         }
 
         // GMをメンバーとみなすか、みなさないか問題は、send_role コマンドにGMがいたかどうかで判断する
@@ -812,13 +758,13 @@ export class Controller {
             .parseMemberRoleSetting(memberList);
 
         if (memberRoleList.length == 0) {
-            return MyFuncs.createErrorReply(eMessage.C05_RoleDataNothingInData);
+            return MessageFactory.createErrorReply(eMessage.C05_RoleDataNothingInData);
         }
 
         // 追放者を除く
         memberRoleList = memberRoleList.filter(m => !data.eject_member_list.some(em => em.id == m.id));
         if (memberRoleList.length == 0) {
-            return MyFuncs.createErrorReply(eMessage.C05_AllMemberEjected);
+            return MessageFactory.createErrorReply(eMessage.C05_AllMemberEjected);
         }
 
         let msg = "";
@@ -840,7 +786,7 @@ export class Controller {
             .setTimestamp()
             .toJSON();
 
-        return MyFuncs.createSuccessSendSameChannel({
+        return MessageFactory.createSuccessSendSameChannel({
             embeds: [embed],
             addAction: async (rp: Message<boolean>) => {
                 for (const memRole of memberRoleList) {
@@ -860,16 +806,16 @@ export class Controller {
     ejectMemberForVote = async (isDM: boolean, channelId: string, ch: Channel, sender: MyUser, cmd: CommandParser, inputMenbers: MyUser[]): Promise<MyResult> => {
         if (isDM) {
             // メンバーを指定するのでサーバーのチャンネルからどうぞ
-            return MyFuncs.createErrorReply(eMessage.C06_NotAllowFromDM);
+            return MessageFactory.createErrorReply(eMessage.C06_NotAllowFromDM);
         }
 
         const { status, value: data } = await this.connectedDB.asyncSelectSplaJinroDataForce(channelId);
         if (status != ResultOK) {
-            return MyFuncs.createErrorReply(status);
+            return MessageFactory.createErrorReply(status);
         }
 
         if (!data.prev_send_role_command_string) {
-            return MyFuncs.createErrorReply(eMessage.C05_NotStartJinro);
+            return MessageFactory.createErrorReply(eMessage.C05_NotStartJinro);
         }
 
         // 現追放者リスト
@@ -909,7 +855,7 @@ export class Controller {
                 .setDescription(ejected == "" ? "まだいませんよ。まだね。" : ejected)
                 .toJSON();
 
-            return MyFuncs.createSuccessSendSameChannel({
+            return MessageFactory.createSuccessSendSameChannel({
                 content: "現在の生存者と追放者は以下の通りです。",
                 embeds: [embedAlive, embedEjected],
             },);
@@ -922,7 +868,7 @@ export class Controller {
                 'eject_member_list': ejectList,
             });
             if (!updSuccess) {
-                return MyFuncs.createErrorReply(eMessage.C00_DBError,);
+                return MessageFactory.createErrorReply(eMessage.C00_DBError,);
             }
 
             // 参照モードを利用して最終的なメンバーのメッセージを取得し、返信
@@ -937,7 +883,7 @@ export class Controller {
                 'eject_member_list': ejectList,
             });
             if (!updSuccess) {
-                return MyFuncs.createErrorReply(eMessage.C00_DBError,);
+                return MessageFactory.createErrorReply(eMessage.C00_DBError,);
             }
 
             // 参照モードを利用して最終的なメンバーのメッセージを取得し、返信
@@ -946,18 +892,18 @@ export class Controller {
         }
 
         // ここには来ないはず（コマンドミス以外では）
-        return MyFuncs.createSuccessReply(`${cmd.command} のコマンド指定が間違っているようどす。`);
+        return MessageFactory.createSuccessReply(`${cmd.command} のコマンド指定が間違っているようどす。`);
     }
 
     updateSendRoleOption = async (isDM: boolean, channelId: string, cmd: CommandParser): Promise<MyResult> => {
         if (isDM) {
-            return MyFuncs.createErrorReply(eMessage.C00_NotAllowFromDM,);
+            return MessageFactory.createErrorReply(eMessage.C00_NotAllowFromDM,);
         }
 
         // asyncSelectSplaJinroDataForce を呼ぶことで、データが未登録の場合でも自動的にInsertされる
         const { status, value: data } = await this.connectedDB.asyncSelectSplaJinroDataForce(channelId);
         if (status != ResultOK) {
-            return MyFuncs.createErrorReply(status);
+            return MessageFactory.createErrorReply(status);
         }
 
         // オプション更新
@@ -974,7 +920,7 @@ export class Controller {
             }
         }
 
-        return MyFuncs.createSuccessReply(eMessage.C07_EnabledOptions, msg);
+        return MessageFactory.createSuccessReply(eMessage.C07_EnabledOptions, msg);
     }
 
     /**
@@ -991,15 +937,15 @@ export class Controller {
 
         const { status, value: data } = await this.connectedDB.asyncSelectSplaJinroDataForce(channelId,);
         if (!data) {
-            return MyFuncs.createErrorReply(eMessage.C08_DataNothing,);
+            return MessageFactory.createErrorReply(eMessage.C08_DataNothing,);
         }
 
         const delSuccess = await this.connectedDB.asyncDeleteSplaJinroData(channelId);
         if (!delSuccess) {
-            return MyFuncs.createErrorReply(eMessage.C08_DBError,);
+            return MessageFactory.createErrorReply(eMessage.C08_DBError,);
         }
 
-        return MyFuncs.createSuccessReply(eMessage.C08_ClearMemberData,);
+        return MessageFactory.createSuccessReply(eMessage.C08_ClearMemberData,);
     }
 
     buildTeam = async (isDM: boolean, channelId: string, ch: Channel, sender: MyUser, cmd: CommandParser): Promise<MyResult> => {
@@ -1019,7 +965,7 @@ export class Controller {
         }
 
         if (memberList.length == 0) {
-            return MyFuncs.createErrorReply(eMessage.C09_MemberNotFound);
+            return MessageFactory.createErrorReply(eMessage.C09_MemberNotFound);
         }
 
         let teamA: string[] = [];
@@ -1082,28 +1028,28 @@ export class Controller {
             embeds.push(embedOther);
         }
 
-        return MyFuncs.createSuccessSendSameChannel({ content: "チームを作りました", embeds: embeds, },);
+        return MessageFactory.createSuccessSendSameChannel({ content: "チームを作りました", embeds: embeds, },);
     }
 
     messageCopy = async (isDM: boolean, client: Client, ch: Channel, sender: MyUser, cmd: CommandParser, interaction?: Interaction): Promise<MyResult> => {
         if (isDM) {
-            return MyFuncs.createErrorReply(eMessage.C00_NotAllowFromDM,);
+            return MessageFactory.createErrorReply(eMessage.C00_NotAllowFromDM,);
         }
         // 上記とかぶるが、型チェックしておきたいので
         if (ch.isDMBased()) {
-            return MyFuncs.createErrorReply(eMessage.C00_NotAllowFromDM,);
+            return MessageFactory.createErrorReply(eMessage.C00_NotAllowFromDM,);
         }
 
         const selectedChannelId = cmd.getValue(0, 1)!;
         const targetChannel = await client.channels.fetch(selectedChannelId);
         if (!targetChannel) {
-            return MyFuncs.createErrorReply("チャンネルがありません。",);
+            return MessageFactory.createErrorReply("チャンネルがありません。",);
         }
         if (!targetChannel.isTextBased()) {
-            return MyFuncs.createErrorReply("コピー先にはテキストチャンネルを指定してください。",);
+            return MessageFactory.createErrorReply("コピー先にはテキストチャンネルを指定してください。",);
         }
         if (!targetChannel.isTextBased()) {
-            return MyFuncs.createErrorReply("コピー先にはテキストチャンネルを指定してください。",);
+            return MessageFactory.createErrorReply("コピー先にはテキストチャンネルを指定してください。",);
         }
 
         let isDatetimeRange = cmd.existsOption(eCommandOptions.datetimeRange);
@@ -1114,11 +1060,11 @@ export class Controller {
 
             const match = messageLink.match(regex);
             if (!match) {
-                return MyFuncs.createErrorReply("無効なリンクです。正しいメッセージリンクを入力してください。",);
+                return MessageFactory.createErrorReply("無効なリンクです。正しいメッセージリンクを入力してください。",);
             }
             const [, guildId, channelId, messageId] = match;
             if (ch.guildId != guildId) {
-                return MyFuncs.createErrorReply("同じサーバー内のチャンネル間でのみコピーできます。",);
+                return MessageFactory.createErrorReply("同じサーバー内のチャンネル間でのみコピーできます。",);
             }
             let msg: Message<boolean>;
             try {
@@ -1128,19 +1074,19 @@ export class Controller {
                 }
                 msg = await channel!.messages.fetch(messageId);
             } catch (error) {
-                return MyFuncs.createErrorReply("指定されたメッセージを取得できませんでした。",);
+                return MessageFactory.createErrorReply("指定されたメッセージを取得できませんでした。",);
             }
 
             // 型チェックをしたいだけ
             if (msg.channel.isDMBased()) {
-                return MyFuncs.createErrorReply("DMチャンネルからは参照できません。",);
+                return MessageFactory.createErrorReply("DMチャンネルからは参照できません。",);
             }
 
             // 添付ファイルの処理
             const attachments = msg.attachments.map(attachment => attachment.url);
 
             // メッセージを再投稿するコマンドリストを作成
-            return MyFuncs.createSuccessSendOtherChannel(targetChannel, {
+            return MessageFactory.createSuccessSendOtherChannel(targetChannel, {
                 embeds: [
                     {
                         author: {
@@ -1166,7 +1112,7 @@ export class Controller {
         // 日付範囲指定による複数メッセージのコピー
 
         if (!interaction) {
-            return MyFuncs.createErrorReply("スラッシュコマンド専用コマンドです。",);
+            return MessageFactory.createErrorReply("スラッシュコマンド専用コマンドです。",);
         }
 
         const errorRes: MyResult = {
@@ -1193,15 +1139,15 @@ export class Controller {
             return !isNaN(date.getTime());
         }
         if (!isValidDate(from)) {
-            return MyFuncs.createErrorReply("有効な開始日を入力してください。",);
+            return MessageFactory.createErrorReply("有効な開始日を入力してください。",);
         }
         if (!isValidDate(to)) {
-            return MyFuncs.createErrorReply("有効な終了日を入力してください。",);
+            return MessageFactory.createErrorReply("有効な終了日を入力してください。",);
         }
 
         if (!ch.isTextBased()) {
             // コマンドが打たれている以上はありえないケースではある。
-            return MyFuncs.createErrorReply("テキストチャンネルで実行してください。",);
+            return MessageFactory.createErrorReply("テキストチャンネルで実行してください。",);
         }
 
         // メッセージの取得上限が100件、また、並び順が最新からになるため以下の手順で保存する。
@@ -1254,7 +1200,7 @@ export class Controller {
             let groupBy: WorkData[] = [];
             const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
             const asyncPushAndGroupByResetAndSleep = async () => {
-                sendlist.push(MyFuncs.createSendOtherChannel(targetChannel, {
+                sendlist.push(MessageFactory.createSendOtherChannel(targetChannel, {
                     embeds: [
                         {
                             author: groupBy[0].data.author,
@@ -1337,7 +1283,7 @@ export class Controller {
 
         // ボットが送信したメッセージかどうかを確認
         if (!targetMessage.author.bot) {
-            return MyFuncs.createErrorReply("MODが作成したメッセージではないため削除できません。",);
+            return MessageFactory.createErrorReply("MODが作成したメッセージではないため削除できません。",);
         }
 
         // 確認方式が微妙だったのでコメントアウト
@@ -1367,87 +1313,6 @@ export class Controller {
  * 当処理の頻出箇所まとめ
  */
 class MyFuncs {
-    //#region  専用リザルト関連
-    private static updateMessageContent(msg: eMessage | MessageContent, ...args: unknown[]) {
-        if (typeof msg === "string")
-            msg = Utils.format(msg, ...args);
-        else if (msg.content)
-            msg.content = Utils.format(msg.content, ...args);
-        return msg;
-    }
-
-    static createReply = (msg: eMessage | MessageContent, ...args: unknown[]): SendListItem => {
-        return {
-            type: eSendType.sendReply,
-            user: { id: "", name: "" },
-            sendMessage: MyFuncs.updateMessageContent(msg, ...args),
-        };
-    }
-
-    static createReplyDM = (msg: eMessage | MessageContent, ...args: unknown[]): SendListItem => {
-        return {
-            type: eSendType.sendReplyByDM,
-            user: { id: "", name: "" },
-            sendMessage: MyFuncs.updateMessageContent(msg, ...args),
-        };
-    }
-
-    static createDMToOtherUser = (user: MyUser, msg: eMessage | MessageContent, ...args: unknown[]): SendListItem => {
-        return {
-            type: eSendType.sendDMByUserId,
-            user: user,
-            sendMessage: MyFuncs.updateMessageContent(msg, ...args),
-        };
-    }
-
-    static createSendSameChannel = (msg: eMessage | MessageContent, ...args: unknown[]): SendListItem => {
-        return {
-            type: eSendType.sendSameChannel,
-            user: { id: "", name: "" },
-            sendMessage: MyFuncs.updateMessageContent(msg, ...args),
-        };
-    }
-
-    static createSendOtherChannel = (ch: TextBasedChannel, msg: eMessage | MessageContent, ...args: unknown[]): SendListItem => {
-        return {
-            type: eSendType.sendOtherChannel,
-            user: { id: "", name: "" },
-            sendMessage: MyFuncs.updateMessageContent(msg, ...args),
-            targetChannel: ch,
-        };
-    }
-
-    static createErrorReply = (msg: eMessage | MessageContent, ...args: unknown[]): MyResult => {
-        if (typeof msg === "string") {
-            return {
-                status: MyError,
-                sendList: [MyFuncs.createReply({ content: msg, flags: MessageFlags.SuppressNotifications }, ...args)],
-            }
-        }
-        return {
-            status: MyError,
-            sendList: [MyFuncs.createReply(msg, ...args)],
-        }
-    }
-    static createSuccessReply = (msg: eMessage | MessageContent, ...args: unknown[]): MyResult => {
-        return {
-            status: MySuccess,
-            sendList: [MyFuncs.createReply(msg, ...args)],
-        }
-    }
-    static createSuccessSendSameChannel = (msg: eMessage | MessageContent, ...args: unknown[]): MyResult => {
-        return {
-            status: MySuccess,
-            sendList: [MyFuncs.createSendSameChannel(msg, ...args)],
-        }
-    }
-    static createSuccessSendOtherChannel = (ch: TextBasedChannel, msg: eMessage | MessageContent, ...args: unknown[]): MyResult => {
-        return {
-            status: MySuccess,
-            sendList: [MyFuncs.createSendOtherChannel(ch, msg, ...args)],
-        }
-    }
-    //#endregion
 
     /**
      * 参加者取得
