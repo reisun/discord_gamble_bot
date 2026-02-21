@@ -6,7 +6,7 @@ import {
 } from 'discord.js';
 import "./DiscordExtentions";
 import { Controller } from "./Control";
-import { COMMAND_JSONBODYS } from "./Commands";
+import { COMMAND_JSONBODYS_CORE, COMMAND_JSONBODYS_SPLAJINRO, COMMAND_JSONBODYS_GAMBLE } from "./Commands";
 import { CONTEXTMENU_JSONBODYS } from "./ContextMenuCommands";
 
 console.log('import finished!');
@@ -42,7 +42,7 @@ const asyncAddCommand = async (servId: string) => {
     }
     await rest.put(
         Routes.applicationGuildCommands(client.application!.id, servId),
-        { body: (<any>COMMAND_JSONBODYS).concat((<any>CONTEXTMENU_JSONBODYS)) },
+        { body: (<any>COMMAND_JSONBODYS_CORE).concat((<any>COMMAND_JSONBODYS_SPLAJINRO)).concat((<any>COMMAND_JSONBODYS_GAMBLE)).concat((<any>CONTEXTMENU_JSONBODYS)) },
     );
 }
 const asyncRemoveCommand = async (servId: string) => {
