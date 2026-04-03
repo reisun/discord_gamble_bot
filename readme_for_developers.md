@@ -116,6 +116,15 @@ npm test -w @discord-gamble-bot/web
 
 # ウォッチモード
 npm run test:watch -w @discord-gamble-bot/web
+
+# === Discord Bot（単体テスト）===
+# Vitest + モック（Docker 不要、ホスト上のみで完結）
+
+# 全テスト実行（65 件）
+npm test -w @discord-gamble-bot/bot
+
+# ウォッチモード
+npm run test:watch -w @discord-gamble-bot/bot
 ```
 
 ### データベース操作（参考）
