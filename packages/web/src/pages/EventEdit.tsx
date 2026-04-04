@@ -66,13 +66,12 @@ export default function EventEdit() {
   const breadcrumbItems = isNew
     ? [
         { label: 'ホーム', href: `#${eventsBase}${tokenSearch}` },
-        { label: 'イベント一覧', href: `#${eventsBase}${tokenSearch}` },
         { label: '新規作成' },
       ]
     : [
         { label: 'ホーム', href: `#${eventsBase}${tokenSearch}` },
-        { label: 'イベント一覧', href: `#${eventsBase}${tokenSearch}` },
-        { label: name || '編集' },
+        { label: name || '...', href: `#${eventsBase}/${eventId}/games${tokenSearch}` },
+        { label: '編集' },
       ];
 
   if (loading) return <div className="loading">読み込み中...</div>;
