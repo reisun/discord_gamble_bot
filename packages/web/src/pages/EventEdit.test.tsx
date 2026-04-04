@@ -53,10 +53,27 @@ describe('EventEdit', () => {
     expect(nameInput).toHaveValue('');
   });
 
+  it('新規作成: パンくずが設計書どおり「ホーム > 新規作成」で表示される', () => {
+    renderNew();
+
+    expect(screen.getByRole('link', { name: 'ホーム' })).toHaveAttribute('href', '#/events/test-guild-001');
+    expect(screen.getByText('新規作成')).toBeInTheDocument();
+    expect(screen.queryByText('イベント一覧')).not.toBeInTheDocument();
+  });
+
   it('編集: 既存データが入力済みで表示される', async () => {
     renderEdit();
     await waitFor(() => expect(screen.getByDisplayValue('春季大会')).toBeInTheDocument());
     expect(screen.getByDisplayValue('10000')).toBeInTheDocument();
+  });
+
+  it('編集: パンくずが設計書どおり「ホーム > イベント名 > 編集」で表示される', async () => {
+    renderEdit();
+
+    await waitFor(() => expect(screen.getByRole('link', { name: '春季大会' })).toHaveAttribute('href', '#/events/test-guild-001/1/games'));
+    expect(screen.getByRole('link', { name: 'ホーム' })).toHaveAttribute('href', '#/events/test-guild-001');
+    expect(screen.getByText('編集')).toBeInTheDocument();
+    expect(screen.queryByText('イベント一覧')).not.toBeInTheDocument();
   });
 
   it('イベント名が空のまま保存するとエラーが表示される', async () => {
