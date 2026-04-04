@@ -91,6 +91,16 @@ describe('GameList', () => {
     expect(screen.getByText('公開する')).toBeInTheDocument();
   });
 
+  it('管理者がイベント編集ボタンを押すとguildId付きの編集画面URLへ遷移する', async () => {
+    const user = userEvent.setup();
+    renderPage(true);
+
+    await waitFor(() => screen.getByText('編集'));
+    await user.click(screen.getByText('編集'));
+
+    expect(mockNavigate).toHaveBeenCalledWith('/events/test-guild-001/1/edit');
+  });
+
   it('削除ボタンで確認ダイアログが表示され、確定で deleteEvent が呼ばれる', async () => {
     const user = userEvent.setup();
     renderPage(true);

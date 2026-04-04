@@ -101,7 +101,7 @@ export default function GameList() {
           <>
             <button
               className="btn-secondary btn-sm"
-              onClick={() => navigate(`/events/${evId}/edit${tokenSearch}`)}
+              onClick={() => navigate(`${eventsBase}/${evId}/edit${tokenSearch}`)}
             >
               編集
             </button>
